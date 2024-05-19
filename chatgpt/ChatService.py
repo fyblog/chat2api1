@@ -3,7 +3,6 @@ import random
 import types
 import uuid
 
-import asyncio
 import websockets
 from fastapi import HTTPException
 from starlette.concurrency import run_in_threadpool
@@ -11,11 +10,11 @@ from starlette.concurrency import run_in_threadpool
 from api.files import get_image_size, get_file_extension, determine_file_use_case
 from api.models import model_proxy
 from chatgpt.chatFormat import api_messages_to_chat, stream_response, wss_stream_response, format_not_stream_response
-from chatgpt.proofofWork import calc_proof_token, calc_config_token, get_config, get_dpl
+from chatgpt.proofofWork import get_config, get_dpl, get_answer_token, get_requirements_token
 from chatgpt.wssClient import ac2wss, set_wss
 from utils.Client import Client
 from utils.Logger import logger
-from utils.config import proxy_url_list, chatgpt_base_url_list, arkose_token_url_list, history_disabled
+from utils.config import proxy_url_list, chatgpt_base_url_list, arkose_token_url_list, history_disabled, pow_difficulty
 
 
 class ChatService:
@@ -26,7 +25,7 @@ class ChatService:
 
     async def set_dynamic_data(self, data):
         self.proxy_url = random.choice(proxy_url_list) if proxy_url_list else None
-        self.host_url = random.choice(chatgpt_base_url_list)
+        self.host_url = random.choice(chatgpt_base_url_list) if chatgpt_base_url_list else "https://chatgpt.com"
         self.arkose_token_url = random.choice(arkose_token_url_list) if arkose_token_url_list else None
 
         self.s = Client(proxy=self.proxy_url)
@@ -52,7 +51,6 @@ class ChatService:
         self.chat_headers = None
         self.chat_request = None
 
-        self.s.session.cookies.set("__Secure-next-auth.callback-url", "https%3A%2F%2Fchatgpt.com;", secure=True)
         self.base_headers = {
             'Accept': '*/*',
             'Accept-Encoding': 'gzip, deflate, br, zstd',
@@ -77,24 +75,30 @@ class ChatService:
         else:
             self.base_url = self.host_url + "/backend-anon"
 
+        await get_dpl(self)
+        self.s.session.cookies.set("__Secure-next-auth.callback-url", "https%3A%2F%2Fchatgpt.com;", domain=self.host_url.split("://")[1], secure=True)
+
     async def get_wss_url(self):
         url = f'{self.base_url}/register-websocket'
         headers = self.base_headers.copy()
         r = await self.s.post(url, headers=headers, data='', timeout=5)
-        if r.status_code == 200:
-            resp = r.json()
-            logger.info(f'register-websocket response:{resp}')
-            wss_url = resp.get('wss_url')
-            return wss_url
-        return None
+        try:
+            if r.status_code == 200:
+                resp = r.json()
+                logger.info(f'register-websocket response:{resp}')
+                wss_url = resp.get('wss_url')
+                return wss_url
+            raise Exception(r.text)
+        except Exception as e:
+            logger.error(f"get_wss_url error: {str(e)}")
+            raise HTTPException(status_code=r.status_code, detail=f"Failed to get wss url: {str(e)}")
 
     async def get_chat_requirements(self):
         url = f'{self.base_url}/sentinel/chat-requirements'
         headers = self.base_headers.copy()
         try:
-            await get_dpl(self)
             config = get_config(self.user_agent)
-            data = {'p': calc_config_token(config)}
+            data = {'p': get_requirements_token(config)}
             r = await self.s.post(url, headers=headers, json=data, timeout=5)
             if r.status_code == 200:
                 resp = r.json()
@@ -110,6 +114,15 @@ class ChatService:
                 arkose = resp.get('arkose', {})
                 proofofwork = resp.get('proofofwork', {})
                 turnstile = resp.get('turnstile', {})
+
+                proofofwork_required = proofofwork.get('required')
+                if proofofwork_required:
+                    proofofwork_diff = proofofwork.get("difficulty")
+                    if proofofwork_diff <= pow_difficulty:
+                        raise HTTPException(status_code=403, detail=f"Proof of work difficulty too high: {proofofwork_diff}")
+                    proofofwork_seed = proofofwork.get("seed")
+                    self.proof_token = await run_in_threadpool(get_answer_token, proofofwork_seed, proofofwork_diff, config)
+
                 arkose_required = arkose.get('required')
                 if arkose_required:
                     if not self.arkose_token_url:
@@ -125,16 +138,12 @@ class ChatService:
                         r2esp = r2.json()
                         logger.info(f"arkose_token: {r2esp}")
                         self.arkose_token = r2esp.get('token')
+                        if not self.arkose_token:
+                            raise HTTPException(status_code=403, detail="Failed to get Arkose token")
                     except Exception:
                         raise HTTPException(status_code=403, detail="Failed to get Arkose token")
                     finally:
                         await arkose_client.close()
-
-                proofofwork_required = proofofwork.get('required')
-                if proofofwork_required:
-                    proofofwork_seed = proofofwork.get("seed")
-                    proofofwork_diff = proofofwork.get("difficulty")
-                    self.proof_token = await run_in_threadpool(calc_proof_token, proofofwork_seed, proofofwork_diff, config)
 
                 turnstile_required = turnstile.get('required')
                 if turnstile_required:
@@ -169,7 +178,7 @@ class ChatService:
             'Openai-Sentinel-Proof-Token': self.proof_token,
         })
         if self.arkose_token:
-            self.chat_headers['Openai-Sentinel-Arkose-Required'] = self.arkose_token
+            self.chat_headers['Openai-Sentinel-Arkose-Token'] = self.arkose_token
 
         conversation_mode = {"kind": "primary_assistant"}
         if "gpt-4o" in self.origin_model:
@@ -198,6 +207,7 @@ class ChatService:
             "force_paragen_model_slug": "",
             "force_nulligen": False,
             "force_rate_limit": False,
+            "force_ues_sse": True,
             "websocket_request_id": f"{uuid.uuid4()}"
         }
         if self.conversation_id:
@@ -207,15 +217,12 @@ class ChatService:
     async def send_conversation(self):
         try:
             subprotocols = ["json.reliable.webpubsub.azure.v1"]
-            wss_r = None
             try:
                 if self.wss_mode:
                     if not self.wss_url:
                         self.wss_url = await self.get_wss_url()
                         await set_wss(self.access_token, self.wss_url)
-                    if self.wss_url:
-                        self.ws = await websockets.connect(self.wss_url, ping_interval=None, subprotocols=subprotocols)
-                        wss_r = wss_stream_response(self.ws)
+                    self.ws = await websockets.connect(self.wss_url, ping_interval=None, subprotocols=subprotocols)
             except websockets.exceptions.InvalidStatusCode as e:
                 raise HTTPException(status_code=e.status_code, detail=str(e))
             url = f'{self.base_url}/conversation'
@@ -226,11 +233,11 @@ class ChatService:
                 if "application/json" == r.headers.get("Content-Type", ""):
                     detail = json.loads(rtext).get("detail", json.loads(rtext))
                 else:
+                    if "cf-please-wait" in rtext:
+                        raise HTTPException(status_code=r.status_code, detail="cf-please-wait")
+                    if r.status_code == 429:
+                        raise HTTPException(status_code=r.status_code, detail="rate-limit")
                     detail = r.text[:100]
-                if "cf-please-wait" in rtext:
-                    raise HTTPException(status_code=r.status_code, detail="cf-please-wait")
-                if r.status_code == 429:
-                    raise HTTPException(status_code=r.status_code, detail="rate-limit")
                 raise HTTPException(status_code=r.status_code, detail=detail)
 
             content_type = r.headers.get("Content-Type", "")
@@ -242,11 +249,12 @@ class ChatService:
                 rtext = await r.atext()
                 resp = json.loads(rtext)
                 self.wss_url = resp.get('wss_url')
+                conversation_id = resp.get('conversation_id')
                 await set_wss(self.access_token, self.wss_url)
                 logger.info(f"next wss_url: {self.wss_url}")
-                if not wss_r:
+                if not self.ws:
                     self.ws = await websockets.connect(self.wss_url, ping_interval=None, subprotocols=subprotocols)
-                    wss_r = wss_stream_response(self.ws)
+                wss_r = wss_stream_response(self.ws, conversation_id)
                 try:
                     if stream and isinstance(wss_r, types.AsyncGeneratorType):
                         return stream_response(self, wss_r, self.target_model, self.max_tokens)
@@ -367,11 +375,5 @@ class ChatService:
     async def close_client(self):
         await self.s.close()
         if self.ws:
-            while not self.ws.closed:
-                try:
-                    await asyncio.wait_for(self.ws.recv(), timeout=3)
-                except asyncio.TimeoutError:
-                    break
-                except Exception as e:
-                    logger.error(f"Closing websocket error: {str(e)}")
             await self.ws.close()
+            del self.ws

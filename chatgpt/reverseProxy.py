@@ -5,7 +5,7 @@ from fastapi.responses import StreamingResponse, Response
 from starlette.background import BackgroundTask
 
 from utils.Client import Client
-from utils.config import chatgpt_base_url_list, proxy_url_list
+from utils.config import chatgpt_base_url_list, proxy_url_list, enable_gateway
 
 headers_reject_list = [
     "x-real-ip",
@@ -60,6 +60,8 @@ headers_reject_list = [
 
 
 async def chatgpt_reverse_proxy(request: Request, path: str):
+    if not enable_gateway:
+        raise HTTPException(status_code=404, detail="Gateway is disabled")
     try:
         origin_host = request.url.netloc
         if ":" in origin_host:
@@ -69,7 +71,7 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
         if path.startswith("v1/"):
             base_url = "https://ab.chatgpt.com"
         else:
-            base_url = random.choice(chatgpt_base_url_list)
+            base_url = random.choice(chatgpt_base_url_list) if chatgpt_base_url_list else "https://chatgpt.com"
         params = dict(request.query_params)
         headers = {
             key: value for key, value in request.headers.items()
@@ -101,39 +103,42 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
             data = await request.body()
 
         client = Client(proxy=random.choice(proxy_url_list) if proxy_url_list else None)
-        r = None
         try:
+            background = BackgroundTask(client.close)
             r = await client.request(request.method, f"{base_url}/{path}", params=params, headers=headers,
                                      cookies=request_cookies, data=data, stream=True, allow_redirects=False)
             if r.status_code == 304:
-                return Response(status_code=304)
+                return Response(status_code=304, background=background)
             elif r.status_code == 307:
                 if "oai-dm=1" not in r.headers.get("Location"):
                     return Response(status_code=307, headers={
                         "Location": r.headers.get("Location").replace("chat.openai.com", origin_host)
                             .replace("chatgpt.com", origin_host)
-                            .replace("https", petrol) + "?oai-dm=1"})
+                            .replace("https", petrol) + "?oai-dm=1"}, background=background)
                 else:
-                    return Response(status_code=307, headers={"Location": r.headers.get("Location")})
+                    return Response(status_code=307, headers={"Location": r.headers.get("Location")}, background=background)
             elif r.status_code == 302:
                 return Response(status_code=302,
                                 headers={"Location": r.headers.get("Location").replace("chatgpt.com", origin_host)
                                 .replace("chat.openai.com", origin_host)
                                 .replace("ab.chatgpt.com", origin_host)
                                 .replace("cdn.oaistatic.com", origin_host)
-                                .replace("https", petrol)})
+                                .replace("https", petrol)}, background=background)
             elif 'stream' in r.headers.get("content-type", ""):
-                background = BackgroundTask(client.close)
                 return StreamingResponse(r.aiter_content(), media_type=r.headers.get("content-type", ""),
                                          background=background)
             else:
-                content = ((await r.atext()).replace("chatgpt.com", origin_host)
-                           .replace("chat.openai.com", origin_host)
-                           .replace("ab.chatgpt.com", origin_host)
-                           .replace("cdn.oaistatic.com", origin_host)
-                           .replace("https", petrol))
-                response = Response(content=content, media_type=r.headers.get("content-type"),
-                                    status_code=r.status_code)
+                if "/conversation" in path or "/register-websocket" in path:
+                    response = Response(content=(await r.atext()), media_type=r.headers.get("content-type"),
+                                        status_code=r.status_code, background=background)
+                else:
+                    content = ((await r.atext()).replace("chatgpt.com", origin_host)
+                               .replace("chat.openai.com", origin_host)
+                               .replace("ab.chatgpt.com", origin_host)
+                               .replace("cdn.oaistatic.com", origin_host)
+                               .replace("https", petrol))
+                    response = Response(content=content, media_type=r.headers.get("content-type"),
+                                        status_code=r.status_code, background=background)
                 for cookie_name in r.cookies:
                     if cookie_name in request_cookies:
                         continue
@@ -144,9 +149,8 @@ async def chatgpt_reverse_proxy(request: Request, path: str):
                         else:
                             response.set_cookie(key=cookie_name, value=cookie_value)
                 return response
-        finally:
-            if r and 'stream' not in r.headers.get("content-type", ""):
-                await client.close()
+        except Exception:
+            await client.close()
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

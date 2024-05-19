@@ -1,6 +1,6 @@
-import base64
 import io
 
+import pybase64
 from PIL import Image
 
 from utils.Client import Client
@@ -9,7 +9,7 @@ from utils.Client import Client
 async def get_file_content(url):
     if url.startswith("data:"):
         mime_type, base64_data = url.split(';')[0].split(':')[1], url.split(',')[1]
-        file_content = base64.b64decode(base64_data)
+        file_content = pybase64.b64decode(base64_data)
         return file_content, mime_type
     else:
         client = Client()
@@ -21,6 +21,7 @@ async def get_file_content(url):
             return file_content, mime_type
         finally:
             await client.close()
+            del client
 
 
 async def determine_file_use_case(mime_type):
